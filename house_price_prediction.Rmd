@@ -1,0 +1,73 @@
+---
+title: "house_price_prediction"
+author: "Federico Loguercio"
+date: "4/13/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, include = FALSE}
+rm(list=ls())
+
+#Install non-installed packages
+list.of.packages <- c("data.table","bit64","corrplot")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+#Load libraries
+library(data.table)
+library(bit64)
+library(corrplot)
+
+# SET WORKING DIRECTORY TO FOLDER
+setwd('/Users/federicologuercio/Documents/R+/house_price_prediction')
+
+# Load helper functions
+source('helper.R')
+```
+
+
+## House Price Prediction on the Original Kaggle House Prices Dataset
+
+```{r dataimport, include = F}
+# Import Data & split labelled dataset into train and test
+df_validate <- fread('house_price_test.csv', sep = ",")
+df_raw <- f_partition(fread('house_price_train.csv', sep= ","),
+                      test_proportion = 0.2,
+                      seed = 7)
+```
+
+First look at data
+```{r}
+head(df_raw$train)
+```
+
+```{r}
+summary(df_raw$train)
+```
+
+### Data Preprocessing
+```{r}
+# Number of missing values:
+sum(is.na(df_raw$train))
+
+# Drop date in order not to artificiall inflate prediction performance
+df_raw$train$date <- NULL
+df_raw$test$date <- NULL
+df_validate$date <- NULL
+
+df_raw$train$id <- NULL
+df_raw$test$id <- NULL
+df_validate$id <- NULL
+```
+
+### EDA
+```{r}
+# Correlation Matrix
+corr <- cor(df_raw$train)
+corrplot(corr, method = "circle", type = "lower", order = "hclust")
+```
+
