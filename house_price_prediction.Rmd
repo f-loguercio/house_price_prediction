@@ -13,7 +13,8 @@ knitr::opts_chunk$set(echo = TRUE)
 rm(list=ls())
 
 #Install non-installed packages
-list.of.packages <- c("data.table","bit64","corrplot")
+list.of.packages <- c("data.table","bit64","corrplot","ggplot2","GGally","caret",
+                      "ranger")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages)
 
@@ -21,6 +22,10 @@ if(length(new.packages)) install.packages(new.packages)
 library(data.table)
 library(bit64)
 library(corrplot)
+library(ggplot2)
+library(GGally)
+library(caret)
+library(ranger)
 
 # SET WORKING DIRECTORY TO FOLDER
 setwd('/Users/federicologuercio/Documents/R+/house_price_prediction')
@@ -65,9 +70,196 @@ df_validate$id <- NULL
 ```
 
 ### EDA
+
+```{r}
+ggplot(data = df_raw$train, aes(price))+
+  geom_histogram(fill = 'darkblue', binwidth = 100000)
+```
+
 ```{r}
 # Correlation Matrix
 corr <- cor(df_raw$train)
 corrplot(corr, method = "circle", type = "lower", order = "hclust")
+```
+
+The variables most correlated with the target (price) are:
+```{r}
+sort(corr['price',], decreasing = T)[2:6]
+```
+
+Sqft_living and grade are most correlated with price. Let's visualise their relationship:
+```{r}
+# Colouring by price and also adjusting the transparency by price since there are a lot more
+# cheap houses than expensive ones, making it hard to detect a pattern in the expensive ones
+
+ggplot(data = df_raw$train, aes(sqft_living, grade, colour = price, alpha = price)) +
+  geom_point(fill = 'lightblue') +
+  scale_color_continuous(low = '#00B324', high = '#FF0025')
+```
+We can clearly see some huge outliers in price and sqft living. They don't seem abnormal in the sense
+that they follow the overall trend, but they make it hard to discover a trend in the colouring.
+Let's have a look at how things are without them
+```{r}
+ggplot(data = df_raw$train[df_raw$train$sqft_living < 9000], aes(sqft_living, grade, colour = price, alpha = price)) +
+  geom_point(fill = 'lightblue') +
+  scale_color_continuous(low = '#00B324', high = '#FF0025')
+```
+There are no big surprises, with bigger houses costing more and grade being a good discriminator
+for house prices.
+The further sqft measures, as well as 'bathrooms', are all fairly correlated with each other, so I will not further explore them.
+
+How is price distributed within the different levels of grade?
+```{r}
+ggplot(data = df_raw$train, aes(x = factor(grade), y = price)) +
+  geom_boxplot(fill = 'darkblue')
+```
+
+Just looking at sqft and price:
+```{r}
+ggplot(data = df_raw$train, aes(x = sqft_living, y = price)) +
+  geom_point(col = 'darkblue') +
+  geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1))
+```
+The linear relationship is escaped upwards by the very large houses. Price seems to increase more than
+linearly with size.
+
+Relationship of price with the most relevant variables:
+```{r}
+# pp <- ggpairs(data = df_raw$train, columns = c('sqft_living','grade',
+#                                                'sqft_above','sqft_living15',
+#                                                'bathrooms'),
+#               lower = list(
+#                 continuous = "smooth",
+#                 combo = "facetdensity"),
+#                 mapping = aes(colour = df_raw$train$price)
+#               )
+# pp
+```
+
+```{r}
+pair <- ggplot(data = df_raw$train, aes(x=bedrooms, y=sqft_living15, color = price)) +
+  geom_point(alpha = 0.1)
+pair
+```
+
+```{r}
+pair_coord <- ggplot(data = df_raw$train, aes(x=lat, y=long, color = price)) +
+  geom_point(alpha = 0.1)
+pair_coord
+```
+Simply plotting the price on a lat-long grid indicates that there are some location-clusters in terms of price.
+
+```{r}
+# pairplots <- list()
+# 
+# for(x in names(df_raw$train)){
+#   for(y in names(df_raw$train)){
+#     pairplots <- append(pairplots, ggplot(data = df_raw$train, aes(x=x, y=y, color = price)) +
+#       geom_point(alpha = 0.1))
+#   }
+# }
+
+```
+
+```{r}
+# bedrooms must be changed to categorical
+#pairplots <- ggpairs(data = df_raw$train, columns = 1:4, aes(color = bedrooms))
+#pairplots
+```
+
+
+```{r}
+for(var in sort(corr['price',], decreasing = T)[2:6]){
+  ggplot(data = df_raw$train, aes(var, price, color = ))
+}
+```
+
+
+## Baseline
+```{r baseline}
+# Define the validation schema
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions=TRUE
+)
+
+# Define the formula
+formula <- as.formula(price~.)
+
+# Define a tuning grid with just one set of options
+tuneGrid=data.table(expand.grid(mtry=sqrt(ncol(df_raw$train)),
+                                splitrule='variance',
+                                min.node.size=c(5)))
+
+# Fit a baseline
+fit <- train(
+  formula,
+  data = df_raw$train,
+  method = "ranger",
+  preProc=NULL,
+	trControl = ctrl,
+	metric = "MAE"
+)
+
+print(fit$results)
+```
+
+## Remove Outliers
+```{r}
+# Detect outliers
+boxplot(df_raw$train[, 'price'])
+boxplot(df_raw$train[, 'price'])
+boxplot(df_raw$train[, 'sqft_lot'])
+```
+```{r}
+# Define function to cap outliers outside 3*IQR
+capOutlier <- function(x){
+   qnt <- quantile(x, probs=c(.25, .75), na.rm = T)
+   caps <- quantile(x, probs=c(.05, .95), na.rm = T)
+   H <- 3 * IQR(x, na.rm = T)
+   x[x < (qnt[1] - H)] <- caps[1]
+   x[x > (qnt[2] + H)] <- caps[2]
+   return(x)
+}
+
+df_raw$train$price <- capOutlier(df_raw$train$price)
+
+```
+
+
+## Feature Engineering
+```{r FE}
+df_FE_train <- df_raw$train
+df_FE_test <- df_raw$test
+df_FE_validate <- df_validate
+
+#Would need to fit and apply clustering
+# Add location-cluster
+# clustering <- function(df, varvector, n){
+#   df <- data.frame(df)
+#   clusters <- kmeans(df[,varvector], n)
+#   df$cluster_id <- clusters$cluster
+#   df <- data.table(df)
+#   return(df)
+# }
+# 
+# for(DF in list(df_FE_train, df_FE_test, df_FE_validate)){
+#   DF <- clustering(DF, varvector = c('lat','long'), n=10)
+# }
+
+
+```
+
+### Recursive feature elimination
+```{r}
+ctrl <- rfeControl(functions = lmFuncs,
+                   method = "cv",
+                   number = 5,
+                   verbose = FALSE)
+
+lmProfile <- rfe(form = formula,
+                 data = df_raw$train,
+                 rfeControl = ctrl)
 ```
 
