@@ -9,12 +9,30 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+### Introduction
+This script executes a prediction of house prices in king county, with in-depth exploratory data analysis, several steps of feature engineering and grid searches across several models.
+Some notes about the procedure:
+- large part of the preprocessing is performed through caret's preprocess option, such that it does not appear prior to that
+- all training is performed in a parallel manner, taking advantage of the doParallel library, speeding things up considerably
+
+A separate validation set was provided and is unlabelled. Within the labelled data, a 90/10 split will be performed, were 10% will be left out for validation. Throughout training and the several grid searches, 5-fold cross validation is performed and performance on the test set is evaluated based on the best-performing model from cross validation. All results are captured in a dataframe in order to track the achievements of each change.
+
+As for the modelling, first a baseline is fitted, including all variables, with categorical variables being level-encoded. Then, new variables are created. Thereafter, grid-searches are performed for several models and different tweaks such as scaling and PCA are explored.
+
+
+### Sections
+1. Data Import & Preprocessing
+2. EDA
+3. Baseline
+4. Feature Engineering
+5. Modelling
+
 ```{r packages, include = FALSE}
 rm(list=ls())
 
 #Install non-installed packages
 list.of.packages <- c("data.table","bit64","corrplot","ggplot2","GGally","caret",
-                      "ranger")
+                      "ranger", "MLmetrics", "cowplot", "useful", "xgboost", "doParallel")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages)
 
@@ -26,8 +44,13 @@ library(ggplot2)
 library(GGally)
 library(caret)
 library(ranger)
+library(MLmetrics)
+library(cowplot)
+library(useful)
+library(xgboost)
+library(doParallel)
 
-# SET WORKING DIRECTORY TO FOLDER
+# SET WORKING DIRECTORY TO FOLDER HOLDING DATASET
 setwd('/Users/federicologuercio/Documents/R+/house_price_prediction')
 
 # Load helper functions
@@ -38,47 +61,66 @@ source('helper.R')
 ## House Price Prediction on the Original Kaggle House Prices Dataset
 
 ```{r dataimport, include = F}
-# Import Data & split labelled dataset into train and test
+# The data wil be joined into one dataset for easier handling and re-split into train, test and validation later
 df_validate <- fread('house_price_test.csv', sep = ",")
-df_raw <- f_partition(fread('house_price_train.csv', sep= ","),
-                      test_proportion = 0.2,
-                      seed = 7)
+df_validate$price <- NA
+df_raw <- fread('house_price_train.csv', sep= ",")
+data <- rbind(df_raw, df_validate)
+
+# Add an indicator column for the internal train/test split
+test_proportion <- 0.1
+set.seed(7)
+train_index<-sample(nrow(df_raw), floor(nrow(df_raw)*(1-test_proportion)), replace = FALSE)
+# Will be used for plotting and later for actual splitting
+
+rm(df_raw)
+rm(df_validate)
 ```
 
 First look at data
 ```{r}
-head(df_raw$train)
-```
-
-```{r}
-summary(df_raw$train)
+head(data)
 ```
 
 ### Data Preprocessing
 ```{r}
 # Number of missing values:
-sum(is.na(df_raw$train))
+print(sum(is.na(data[!is.na(price)])))
 
 # Drop date in order not to artificiall inflate prediction performance
-df_raw$train$date <- NULL
-df_raw$test$date <- NULL
-df_validate$date <- NULL
+data$date <- NULL
 
-df_raw$train$id <- NULL
-df_raw$test$id <- NULL
-df_validate$id <- NULL
+data$id <- NULL
+
+# Turn integer variables into numeric
+# I will stick to label-encoding for now and one-hot encode later
+# All variables apart from zipcode, lat and long appear to have sense in their order
+int_to_num <- function(df){
+  return(df[ , names(df)[sapply(df, is.integer)]:=
+             lapply(.SD,as.numeric),.SDcols = 
+             names(df)[sapply(df, is.integer)]])
+}
+
+data <- int_to_num(data)
+
+str(data)
 ```
 
-### EDA
+### Exploratory Data Analysis
+In order not to artificially inflate the findings from the EDA, only the internal training data will be explored.
 
 ```{r}
-ggplot(data = df_raw$train, aes(price))+
+df_train <- data[train_index]
+df_test <- data[!train_index][!is.na(price)]
+df_validate <- data[is.na(price)]
+
+ggplot(data = df_train, aes(price))+
   geom_histogram(fill = 'darkblue', binwidth = 100000)
 ```
 
 ```{r}
 # Correlation Matrix
-corr <- cor(df_raw$train)
+corr <- cor(df_train)
 corrplot(corr, method = "circle", type = "lower", order = "hclust")
 ```
 
@@ -88,19 +130,19 @@ sort(corr['price',], decreasing = T)[2:6]
 ```
 
 Sqft_living and grade are most correlated with price. Let's visualise their relationship:
-```{r}
+```{r, echo = F}
 # Colouring by price and also adjusting the transparency by price since there are a lot more
 # cheap houses than expensive ones, making it hard to detect a pattern in the expensive ones
 
-ggplot(data = df_raw$train, aes(sqft_living, grade, colour = price, alpha = price)) +
+ggplot(data = df_train, aes(sqft_living, grade, colour = price, alpha = price)) +
   geom_point(fill = 'lightblue') +
   scale_color_continuous(low = '#00B324', high = '#FF0025')
 ```
 We can clearly see some huge outliers in price and sqft living. They don't seem abnormal in the sense
 that they follow the overall trend, but they make it hard to discover a trend in the colouring.
 Let's have a look at how things are without them
-```{r}
-ggplot(data = df_raw$train[df_raw$train$sqft_living < 9000], aes(sqft_living, grade, colour = price, alpha = price)) +
+```{r, echo = F}
+ggplot(data = df_train[df_train$sqft_living < 9000], aes(sqft_living, grade, colour = price, alpha = price)) +
   geom_point(fill = 'lightblue') +
   scale_color_continuous(low = '#00B324', high = '#FF0025')
 ```
@@ -109,19 +151,57 @@ for house prices.
 The further sqft measures, as well as 'bathrooms', are all fairly correlated with each other, so I will not further explore them.
 
 How is price distributed within the different levels of grade?
-```{r}
-ggplot(data = df_raw$train, aes(x = factor(grade), y = price)) +
+```{r, echo = F}
+ggplot(data = df_train, aes(x = factor(grade), y = price)) +
   geom_boxplot(fill = 'darkblue')
 ```
 
 Just looking at sqft and price:
-```{r}
-ggplot(data = df_raw$train, aes(x = sqft_living, y = price)) +
+```{r, echo = F}
+ggplot(data = df_train, aes(x = sqft_living, y = price)) +
   geom_point(col = 'darkblue') +
   geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1))
 ```
-The linear relationship is escaped upwards by the very large houses. Price seems to increase more than
-linearly with size.
+The linear relationship is escaped upwards by the very large houses. Price seems to increase more than linearly with size.
+It also is interesting to see that the most expensive houses for each size lie on a precise line.
+
+How did prices evolve over time?
+```{r, echo = F}
+ggplot(data = df_train, aes(x = factor(yr_built), y = price)) +
+  geom_violin(col = 'darkblue')
+```
+While this plot is awfully crowded, it shows an important point: Prices overall do seem to be increasing over time, but compared to how much the prices of luxury-homes increase, the changes in lower-priced houses is much less noticable.
+
+Switching to hexagons, a trend in the lower sector seems more apparent:
+```{r, echo = F}
+ggplot(data = df_train, aes(x = factor(yr_built), y = price)) +
+  geom_hex(col = 'darkblue') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+How about we forget about the expensive homes for a moment:
+```{r}
+ggplot(data = df_train[df_train$price < 2e6], aes(x = factor(yr_built), y = price)) +
+  geom_boxplot(col = 'darkblue') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+Within the not-so-high price segment, we see the same pattern being repeated. Prices of the less expensive houses remain fairly stable, while the number of houses costing over 1 million USD increases steadily.
+
+One million is pretty damn high though, don't you think? In which price range are most of the houses actually?
+```{r, echo = F}
+print('The respective quantiles are:')
+quantile(df_train$price)
+```
+While houses prices overall are high, 75% of houses cost below 647k USD. What about the distribution within that range?
+```{r}
+ggplot(data = df_train[df_train$price < 647000], aes(x = factor(yr_built), y = price)) +
+  geom_boxplot(col = 'darkblue') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+While still not that strong, an overall upward trend becomes more apparent here. While this analysis focused on the relationship between built-year and price, it teaches us an important lesson: trends within the high-price segment might overshadow trends affecting the majority of cases, due to the higher-than-linear magnitude. The plot above also suggests that we might want to investigate the year 1933 (I admit, I zoomed in and checked), as we can see house prices plummeting that year.
+
+Within all of this, we need to keep in mind that those all are bivariate or at most trivariate analyses. Some of the trends and patterns we see may very well be driven by a different variable which we are omitting in that plot, so that we should not interpret too much into whichever functional shapes we believe to recognise.
+
 
 Relationship of price with the most relevant variables:
 ```{r}
@@ -137,13 +217,13 @@ Relationship of price with the most relevant variables:
 ```
 
 ```{r}
-pair <- ggplot(data = df_raw$train, aes(x=bedrooms, y=sqft_living15, color = price)) +
+pair <- ggplot(data = df_train, aes(x=bedrooms, y=sqft_living15, color = price)) +
   geom_point(alpha = 0.1)
 pair
 ```
 
 ```{r}
-pair_coord <- ggplot(data = df_raw$train, aes(x=lat, y=long, color = price)) +
+pair_coord <- ggplot(data = df_train, aes(x=lat, y=long, color = price)) +
   geom_point(alpha = 0.1)
 pair_coord
 ```
@@ -169,97 +249,305 @@ Simply plotting the price on a lat-long grid indicates that there are some locat
 
 
 ```{r}
-for(var in sort(corr['price',], decreasing = T)[2:6]){
-  ggplot(data = df_raw$train, aes(var, price, color = ))
-}
+# for(var in sort(corr['price',], decreasing = T)[2:6]){
+#   ggplot(data = df_raw$train, aes(var, price, color = ))
+# }
 ```
 
 
 ## Baseline
+
+### Pararellization
+In order to speed up the whole training in caret, I will parallelize the processes.
+```{r}
+cl <- makePSOCKcluster(4) # I have 4 cores, this can be adapted
+registerDoParallel(cl)
+## All subsequent models are  run in parallel
+```
+
+
 ```{r baseline}
+mape <- function(actual, predicted){
+  mean(abs((actual - predicted)/actual))
+}
+
+mapeSummary <- function (data,
+    lev = NULL,
+    model = NULL) {
+    c(MAPE=mean(abs((data$obs - data$pred)/data$obs)),
+        RMSE=sqrt(mean((data$obs-data$pred)^2)),
+        Rsquared=summary(lm(pred ~ obs, data))$r.squared)
+}
+
 # Define the validation schema
 ctrl <- trainControl(
   method = "cv",
   number = 5,
-  savePredictions=TRUE
+  savePredictions=TRUE,
+  summaryFunction = mapeSummary
 )
 
 # Define the formula
 formula <- as.formula(price~.)
 
-# Define a tuning grid with just one set of options
-tuneGrid=data.table(expand.grid(mtry=sqrt(ncol(df_raw$train)),
-                                splitrule='variance',
-                                min.node.size=c(5)))
-
 # Fit a baseline
-fit <- train(
+# All categorical variables are left level-encoded
+fit_baseline <- train(
   formula,
-  data = df_raw$train,
-  method = "ranger",
+  data = df_train,
+  method = "lm",
   preProc=NULL,
 	trControl = ctrl,
-	metric = "MAE"
+	metric = "RMSE"
 )
 
-print(fit$results)
+print(fit_baseline$results)
 ```
 
-## Remove Outliers
+Save results to dataframe in order to track improvements
 ```{r}
-# Detect outliers
-boxplot(df_raw$train[, 'price'])
-boxplot(df_raw$train[, 'price'])
-boxplot(df_raw$train[, 'sqft_lot'])
-```
-```{r}
-# Define function to cap outliers outside 3*IQR
-capOutlier <- function(x){
-   qnt <- quantile(x, probs=c(.25, .75), na.rm = T)
-   caps <- quantile(x, probs=c(.05, .95), na.rm = T)
-   H <- 3 * IQR(x, na.rm = T)
-   x[x < (qnt[1] - H)] <- caps[1]
-   x[x > (qnt[2] + H)] <- caps[2]
-   return(x)
+results <- data.table(Fit=rep("", 10),
+                 r_2_cv=rep(0, 10),
+                 MAPE_cv=rep(0, 10),
+                 r_2_test=rep(0, 10),
+                 MAPE_test=rep(0, 10),
+                 stringsAsFactors=FALSE)
+
+baseline_pred_test <- predict(fit_baseline, df_test)
+
+add_to_results <- function(fit, name, row, test_actual, test_pred){
+  results[row, 1] <- name
+  results[row, 2] <- max(fit$results$Rsquared)
+  results[row, 3] <- min(fit$results$MAPE)
+  results[row, 4] = R2_Score(y_true = test_actual$price, y_pred = test_pred)
+  results[row, 5] = MAPE(y_true = test_actual$price, y_pred = test_pred)
+  results
 }
 
-df_raw$train$price <- capOutlier(df_raw$train$price)
+results <- add_to_results(fit = fit_baseline, name = 'baseline', row = 1,
+                          test_actual = test_FE, test_pred = baseline_pred_test)
+```
 
+
+## Outlier Removal
+```{r}
+#Manually explore the variables' distributions and exclude outliers based on boundaries
+numeric_vars <- df_train[ , names(df_train)[sapply(df_train, is.numeric)]] 
+outlier_plots = list()
+for (i in numeric_vars){
+  outlier_plots[[i]] <-
+    ggplot(
+      df_train,
+      aes_string(x=i, y = 'price')) +
+      geom_point() +
+      theme_bw()
+}
+
+outlier_plots[1:19]
+```
+
+The most extreme outliers will be removed
+```{r}
+#df_train <- df_train[price < 4e6, sqft_basement < 3000, sqft_above < 7500, sqft_lot < 8e5, ]
+#Perhaps, first try without outlier removal
 ```
 
 
 ## Feature Engineering
 ```{r FE}
-df_FE_train <- df_raw$train
-df_FE_test <- df_raw$test
-df_FE_validate <- df_validate
-
-#Would need to fit and apply clustering
-# Add location-cluster
-# clustering <- function(df, varvector, n){
-#   df <- data.frame(df)
-#   clusters <- kmeans(df[,varvector], n)
-#   df$cluster_id <- clusters$cluster
-#   df <- data.table(df)
-#   return(df)
-# }
-# 
-# for(DF in list(df_FE_train, df_FE_test, df_FE_validate)){
-#   DF <- clustering(DF, varvector = c('lat','long'), n=10)
-# }
-
-
+# Going to be applying the transformations to all three
+df_list <- list(train_FE = df_train, test_FE = df_test, val_FE = df_validate)
 ```
 
-### Recursive feature elimination
+#### Cartesian to polar
+Turn cartesian to polar coordinates (often more easily linearly separable)
 ```{r}
-ctrl <- rfeControl(functions = lmFuncs,
-                   method = "cv",
-                   number = 5,
-                   verbose = FALSE)
+cart_2_polar <- function(df, lat, long){
+  pols <- cart2pol(df[,long], df[,lat])
+  df$r <- pols$r
+  df$theta <- pols$theta
+  return(df)
+}
 
-lmProfile <- rfe(form = formula,
-                 data = df_raw$train,
-                 rfeControl = ctrl)
+df_list <- lapply(df_list, function(df) {
+  df <- cart_2_polar(df, 'lat', 'long')
+  df} )
+```
+
+#### Size-difference
+Create size-difference and drop the sqft_15-features
+sqft15 refers to the size in 2015, so the difference indicates whether there have been renovations.
+```{r}
+df_list <- lapply(df_list, function(df){
+  df[, sqft_living_diff:= sqft_living15 - sqft_living ]
+  df[, sqft_lot_diff:= sqft_lot15 - sqft_lot]
+  df$sqft_living15 <- NULL
+  df$sqft_lot15 <- NULL
+  df
+})
+```
+
+#### 1933-Crisis Dummy
+We had seen a weird drop of house prices before:
+```{r}
+ggplot(data = df_train[(df_train$price < 647000 & df_train$yr_built >= 1925 & df_train$yr_built <= 1945)], aes(x = factor(yr_built), y = price)) +
+  geom_boxplot(col = 'darkblue') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+We can see a first dip in 1932, a low point in 1933 and a recovery after that. This is in line with the US national mortgage crisis of the 1930s as well as the New Deal (1933) and the National Housing Act of 1934.
+In order to aid the model, I will add a dummy marking these historical events.
+```{r}
+df_list <- lapply(df_list, function(df){
+  df[, dummy_33 := ifelse(yr_built == 1933, 1, 0)]
+  df
+})
+```
+
+#### Renovated-dummy
+Most entries for this variable are 0, because most houses have not been renovated
+```{r}
+ggplot(data = train_FE, aes(yr_renovated)) +
+  geom_histogram()
+```
+
+Looking only at the houses which have been renovated:
+```{r}
+ggplot(data = train_FE[yr_renovated != 0,], aes(yr_renovated)) +
+  geom_histogram()
+```
+
+```{r}
+# Let's create one variable indicating, whether the house has been renovated
+df_list <- lapply(df_list, function(df){
+  df[, renovated := ifelse(yr_renovated != 0, 1, 0)]
+  df
+})
+
+# And another variable indicating how much time has passed since the renovation
+# Keeping a very large number for the ones that have not been renovated
+df_list <- lapply(df_list, function(df){
+  df[, t_since_renov := 2016 - yr_renovated] # last entries seem to be 2015
+  df$yr_renovated <- NULL
+  df
+})
+```
+
+One-hot encoding of categorical variables (including zipcode) will be explored later.
+### Caret preprocessing???
+
+Feature selection will for now not be performed, as RF etc technically perform it themselves
+### Recursive feature elimination using random forests
+```{r}
+# train_FE <- df_list[1]$train_FE
+# 
+# ctrl_rfe <- rfeControl(functions = rfFuncs,
+#                    method = "cv",
+#                    number = 5,
+#                    verbose = FALSE)
+# 
+# rfProfile <- rfe(form = formula,
+#                  data = train_FE,
+#                  sizes = 
+#                  rfeControl = ctrl_rfe)
+```
+
+### Model Selection
+Try different estimators and compare them
+
+#### Random Forest
+```{r}
+train_FE <- df_list[1]$train_FE
+test_FE <- df_list[2]$test_FE
+validate_FE <- df_list[3]$val_FE
+
+tuneGrid_ranger <- data.table(expand.grid(mtry=c(round(sqrt(length(train_FE))), round(1/2 * (length(train_FE)))),
+                              splitrule='variance',
+                              min.node.size=c(5,10)))
+
+ctrl_ranger <- trainControl(
+  method = "cv",
+  number = 5,
+  savePredictions=TRUE,
+  summaryFunction = mapeSummary
+)
+
+set.seed(123)
+rangerFit <- train(
+  formula,
+  data = train_FE,
+  method = "ranger", num.trees=100,
+  preProc = NULL, 
+  tuneGrid = tuneGrid_ranger,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = rangerFit, name = 'RF', row = 2,
+                          test_actual = test_FE, test_pred = predict(rangerFit, test_FE))
+```
+
+#### XGBoost
+```{r}
+tuneGrid_xgb <- expand.grid(nrounds = c(100,200),  # this is n_estimators in the python code above
+                       max_depth = c(10, 15, 25),
+                       colsample_bytree = seq(0.5, 0.9),
+                       ## The values below are default values in the sklearn-api. 
+                       eta = 0.1,
+                       gamma=0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+
+ctrl_xgb <- trainControl(
+  method = "cv",
+  number = 5,
+  allowParallel = TRUE,
+  savePredictions=TRUE,
+  summaryFunction = mapeSummary
+)
+
+set.seed(123)
+gbmFit <- train(
+  formula,
+  data = train_FE,
+  method = "xgbTree",
+  preProc = NULL, 
+  tuneGrid = tuneGrid_xgb,
+  trControl = ctrl_xgb,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = gbmFit, name = 'GBM', row = 3,
+                          test_actual = test_FE, test_pred = predict(gbmFit, test_FE))
+```
+
+
+### Preprocessing
+Let's see if some preprocessing can improve the model
+
+Beginning with some standard preprocessing
+```{r}
+set.seed(123)
+gbmFit_preproc <- train(
+  formula,
+  data = train_FE,
+  method = "xgbTree",
+  preProc = c('center','scale'), 
+  tuneGrid = tuneGrid_xgb,
+  trControl = ctrl_xgb,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = gbmFit_preproc, name = 'GBM_preproc', row = 4,
+                          test_actual = test_FE, test_pred = predict(gbmFit_preproc, test_FE))
+```
+
+
+
+
+
+Quitting the cluster
+```{r}
+stopCluster(cl)
 ```
 
