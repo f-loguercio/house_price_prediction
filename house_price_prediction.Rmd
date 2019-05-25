@@ -15,7 +15,8 @@ Some notes about the procedure:
 - large part of the preprocessing is performed through caret's preprocess option, such that it does not appear prior to that
 - all training is performed in a parallel manner, taking advantage of the doParallel library, speeding things up considerably
 
-A separate validation set was provided and is unlabelled. Within the labelled data, a 90/10 split will be performed, were 10% will be left out for validation. Throughout training and the several grid searches, 5-fold cross validation is performed and performance on the test set is evaluated based on the best-performing model from cross validation. All results are captured in a dataframe in order to track the achievements of each change.
+A separate validation set was provided and is unlabelled. Within the labelled data, a 90/10 split will be performed, were 10% will be left out for validation. Throughout training and the several grid searches, 5-fold cross validation is performed and performance on the test set is evaluated based on the best-performing model from cross validation. All results are captured in a dataframe in order to track the achievements of each change. 
+Throughout the iterations, checking that CV-performance is close to Test-performance demonstrates we are not in some way overfitting the training data.
 
 As for the modelling, first a baseline is fitted, including all variables, with categorical variables being level-encoded. Then, new variables are created. Thereafter, grid-searches are performed for several models and different tweaks such as scaling and PCA are explored.
 
@@ -32,7 +33,8 @@ rm(list=ls())
 
 #Install non-installed packages
 list.of.packages <- c("data.table","bit64","corrplot","ggplot2","GGally","caret",
-                      "ranger", "MLmetrics", "cowplot", "useful", "xgboost", "doParallel")
+                      "ranger", "MLmetrics", "cowplot", "useful", "xgboost", "doParallel",
+                      "tidyverse")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages)
 
@@ -49,6 +51,7 @@ library(cowplot)
 library(useful)
 library(xgboost)
 library(doParallel)
+library(tidyverse)
 
 # SET WORKING DIRECTORY TO FOLDER HOLDING DATASET
 setwd('/Users/federicologuercio/Documents/R+/house_price_prediction')
@@ -62,19 +65,16 @@ source('helper.R')
 
 ```{r dataimport, include = F}
 # The data wil be joined into one dataset for easier handling and re-split into train, test and validation later
-df_validate <- fread('house_price_test.csv', sep = ",")
-df_validate$price <- NA
+df_validate_raw <- fread('house_price_test.csv', sep = ",")
+df_validate_raw$price <- NA
 df_raw <- fread('house_price_train.csv', sep= ",")
-data <- rbind(df_raw, df_validate)
+data <- rbind(df_raw, df_validate_raw)
 
 # Add an indicator column for the internal train/test split
 test_proportion <- 0.1
 set.seed(7)
 train_index<-sample(nrow(df_raw), floor(nrow(df_raw)*(1-test_proportion)), replace = FALSE)
 # Will be used for plotting and later for actual splitting
-
-rm(df_raw)
-rm(df_validate)
 ```
 
 First look at data
@@ -85,9 +85,9 @@ head(data)
 ### Data Preprocessing
 ```{r}
 # Number of missing values:
-print(sum(is.na(data[!is.na(price)])))
+print(sapply(data[, -1], function(x) sum(is.na(x))))
 
-# Drop date in order not to artificiall inflate prediction performance
+# Drop date in order not to artificially inflate prediction performance
 data$date <- NULL
 
 data$id <- NULL
@@ -105,6 +105,22 @@ data <- int_to_num(data)
 
 str(data)
 ```
+
+### Duplicates
+Some houses are repeated throghout the dataset. These are houses that have whose price has been recorded at different points in time.
+```{r}
+sum(duplicated(data))
+sum(duplicated(data[,-1]))
+```
+We have 12 duplicates with the same price and 186 duplicates where the price changed over time. Since we are talking about rather few occurences, I will simply drop the duplicates.
+
+```{r}
+data <- data[!duplicated(data[,-1]),]
+
+# Re-write train_index
+train_index<-sample(nrow(data[!is.na(data$price),]), floor(nrow(data[!is.na(data$price),]))*(1-test_proportion), replace = FALSE)
+```
+
 
 ### Exploratory Data Analysis
 In order not to artificially inflate the findings from the EDA, only the internal training data will be explored.
@@ -203,19 +219,6 @@ While still not that strong, an overall upward trend becomes more apparent here.
 Within all of this, we need to keep in mind that those all are bivariate or at most trivariate analyses. Some of the trends and patterns we see may very well be driven by a different variable which we are omitting in that plot, so that we should not interpret too much into whichever functional shapes we believe to recognise.
 
 
-Relationship of price with the most relevant variables:
-```{r}
-# pp <- ggpairs(data = df_raw$train, columns = c('sqft_living','grade',
-#                                                'sqft_above','sqft_living15',
-#                                                'bathrooms'),
-#               lower = list(
-#                 continuous = "smooth",
-#                 combo = "facetdensity"),
-#                 mapping = aes(colour = df_raw$train$price)
-#               )
-# pp
-```
-
 ```{r}
 pair <- ggplot(data = df_train, aes(x=bedrooms, y=sqft_living15, color = price)) +
   geom_point(alpha = 0.1)
@@ -228,31 +231,6 @@ pair_coord <- ggplot(data = df_train, aes(x=lat, y=long, color = price)) +
 pair_coord
 ```
 Simply plotting the price on a lat-long grid indicates that there are some location-clusters in terms of price.
-
-```{r}
-# pairplots <- list()
-# 
-# for(x in names(df_raw$train)){
-#   for(y in names(df_raw$train)){
-#     pairplots <- append(pairplots, ggplot(data = df_raw$train, aes(x=x, y=y, color = price)) +
-#       geom_point(alpha = 0.1))
-#   }
-# }
-
-```
-
-```{r}
-# bedrooms must be changed to categorical
-#pairplots <- ggpairs(data = df_raw$train, columns = 1:4, aes(color = bedrooms))
-#pairplots
-```
-
-
-```{r}
-# for(var in sort(corr['price',], decreasing = T)[2:6]){
-#   ggplot(data = df_raw$train, aes(var, price, color = ))
-# }
-```
 
 
 ## Baseline
@@ -276,7 +254,7 @@ mapeSummary <- function (data,
     model = NULL) {
     c(MAPE=mean(abs((data$obs - data$pred)/data$obs)),
         RMSE=sqrt(mean((data$obs-data$pred)^2)),
-        Rsquared=summary(lm(pred ~ obs, data))$r.squared)
+        Rsquared_adj=summary(lm(pred ~ obs, data))$adj.r.squared) # use adj. Rsquared for model comparability
 }
 
 # Define the validation schema
@@ -306,50 +284,28 @@ print(fit_baseline$results)
 
 Save results to dataframe in order to track improvements
 ```{r}
-results <- data.table(Fit=rep("", 10),
-                 r_2_cv=rep(0, 10),
-                 MAPE_cv=rep(0, 10),
-                 r_2_test=rep(0, 10),
-                 MAPE_test=rep(0, 10),
+results <- data.table(Fit=rep("", 15),
+                 r_2_adj_cv=rep(0, 15),
+                 MAPE_cv=rep(0, 15),
+                 r_2_adj_test=rep(0, 15),
+                 MAPE_test=rep(0, 15),
                  stringsAsFactors=FALSE)
 
 baseline_pred_test <- predict(fit_baseline, df_test)
 
+# Manually set formula for r2 adjusted of test set predictions
 add_to_results <- function(fit, name, row, test_actual, test_pred){
   results[row, 1] <- name
-  results[row, 2] <- max(fit$results$Rsquared)
+  results[row, 2] <- max(fit$results$Rsquared_adj)
   results[row, 3] <- min(fit$results$MAPE)
-  results[row, 4] = R2_Score(y_true = test_actual$price, y_pred = test_pred)
+  results[row, 4] = 1-(((1-(R2_Score(y_true = test_actual$price, y_pred = test_pred)))*(length(test_pred)))/(length(test_pred) - length(fit$coefnames) - 1))
   results[row, 5] = MAPE(y_true = test_actual$price, y_pred = test_pred)
   results
 }
 
 results <- add_to_results(fit = fit_baseline, name = 'baseline', row = 1,
-                          test_actual = test_FE, test_pred = baseline_pred_test)
-```
-
-
-## Outlier Removal
-```{r}
-#Manually explore the variables' distributions and exclude outliers based on boundaries
-numeric_vars <- df_train[ , names(df_train)[sapply(df_train, is.numeric)]] 
-outlier_plots = list()
-for (i in numeric_vars){
-  outlier_plots[[i]] <-
-    ggplot(
-      df_train,
-      aes_string(x=i, y = 'price')) +
-      geom_point() +
-      theme_bw()
-}
-
-outlier_plots[1:19]
-```
-
-The most extreme outliers will be removed
-```{r}
-#df_train <- df_train[price < 4e6, sqft_basement < 3000, sqft_above < 7500, sqft_lot < 8e5, ]
-#Perhaps, first try without outlier removal
+                          test_actual = df_test, test_pred = baseline_pred_test)
+results[1,]
 ```
 
 
@@ -406,18 +362,18 @@ df_list <- lapply(df_list, function(df){
 #### Renovated-dummy
 Most entries for this variable are 0, because most houses have not been renovated
 ```{r}
-ggplot(data = train_FE, aes(yr_renovated)) +
+ggplot(data = df_train, aes(yr_renovated)) +
   geom_histogram()
 ```
 
 Looking only at the houses which have been renovated:
 ```{r}
-ggplot(data = train_FE[yr_renovated != 0,], aes(yr_renovated)) +
+ggplot(data = df_train[yr_renovated != 0,], aes(yr_renovated)) +
   geom_histogram()
 ```
 
 ```{r}
-# Let's create one variable indicating, whether the house has been renovated
+# Let's create one variable indicating whether the house has been renovated
 df_list <- lapply(df_list, function(df){
   df[, renovated := ifelse(yr_renovated != 0, 1, 0)]
   df
@@ -433,26 +389,12 @@ df_list <- lapply(df_list, function(df){
 ```
 
 One-hot encoding of categorical variables (including zipcode) will be explored later.
-### Caret preprocessing???
 
-Feature selection will for now not be performed, as RF etc technically perform it themselves
-### Recursive feature elimination using random forests
-```{r}
-# train_FE <- df_list[1]$train_FE
-# 
-# ctrl_rfe <- rfeControl(functions = rfFuncs,
-#                    method = "cv",
-#                    number = 5,
-#                    verbose = FALSE)
-# 
-# rfProfile <- rfe(form = formula,
-#                  data = train_FE,
-#                  sizes = 
-#                  rfeControl = ctrl_rfe)
-```
+Feature selection will for now not be performed at this stage, as RF etc technically perform it themselves.
+It will be explored later.
 
-### Model Selection
-Try different estimators and compare them
+## Model Selection
+Try different models and variants and compare them
 
 #### Random Forest
 ```{r}
@@ -476,6 +418,7 @@ rangerFit <- train(
   formula,
   data = train_FE,
   method = "ranger", num.trees=100,
+  importance = 'permutation',
   preProc = NULL, 
   tuneGrid = tuneGrid_ranger,
   trControl = ctrl_ranger,
@@ -484,18 +427,288 @@ rangerFit <- train(
 
 results <- add_to_results(fit = rangerFit, name = 'RF', row = 2,
                           test_actual = test_FE, test_pred = predict(rangerFit, test_FE))
+results[1:2,]
 ```
 
-#### XGBoost
+As mentioned before, some of the variables are categorical variables. They have been handled like numeric variables so far. Some of them (view, condition, grade) could be holding some ordinal meaning, such that it is not a clear call, whether they should be dummy-encoded or kept with their original ordering. For zipcode, on the other hand, it is quite clear that there is no ordinal meaning.
+
+Similarly, year should not necessarily be used like just another numeric variable. One-hot encoding it would lead to a very high number of levels, so instead I will group it by decades.
+
+### One-hot encoding
 ```{r}
-tuneGrid_xgb <- expand.grid(nrounds = c(100,200),  # this is n_estimators in the python code above
-                       max_depth = c(10, 15, 25),
+# Turn desired variables into categorical
+to_cat <- function(df, varlist){
+  for(var in varlist){
+    df[[var]] <- as.factor(df[[var]])
+  }
+  df
+}
+
+# Turn year into decade using modulus
+to_decade <- function(df, var){
+  df[[var]] <- df[[var]] - df[[var]] %% 10
+  df
+}
+
+varlist <- list('zipcode', 'view', 'condition', 'grade', 'yr_built')
+
+train_dummyfied <- to_cat(to_decade(train_FE, 'yr_built'), varlist)
+test_dummyfied <- to_cat(to_decade(test_FE, 'yr_built'), varlist)
+val_dummyfied <- to_cat(to_decade(validate_FE, 'yr_built'), varlist)
+
+dmy <- dummyVars(" ~ .", data = train_dummyfied, fullRank = F)
+# Most tree-based methods theoretically perform better without full rank of categorical variables
+train_dummyfied <- data.frame(predict(dmy, newdata = train_dummyfied))
+test_dummyfied <- data.frame(predict(dmy, newdata = test_dummyfied))
+val_dummyfied <- data.frame(predict(dmy, newdata = val_dummyfied))
+```
+
+Fit the same random forest again
+```{r}
+set.seed(123)
+rangerFit_dum <- train(
+  formula,
+  data = train_dummyfied,
+  method = "ranger", num.trees=100,
+  importance = 'permutation', # in order to calculate variable importance
+  preProc = NULL, 
+  tuneGrid = rangerFit$bestTune,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = rangerFit_dum, name = 'RF_dummyfied', row = 3,
+                          test_actual = test_dummyfied, test_pred = predict(rangerFit_dum, test_dummyfied))
+results[1:3,]
+```
+It performs quite well, but we have a very large amount of variables now for the size of the dataset. Let's attempt some feature selection.
+
+Recursive Feature Elimination (below, commented out) fails to run (on my machine). Therefore, I will resort to analysing variable importance instead and pick variables based on that.
+### RFE
+```{r}
+# ctrl_rfe <- rfeControl(functions = rfFuncs,
+#                    method = "cv",
+#                    number = 5,
+#                    verbose = FALSE)
+# 
+# rfProfile <- rfe(form = formula,
+#                  data = train_dummyfied,
+#                  sizes = c(18, 25),
+#                  rfeControl = ctrl_rfe)
+```
+
+### Variable Importance
+```{r}
+varimp_ranger <- varImp(rangerFit_dum, scale = TRUE)
+plot(varimp_ranger, top = 20)
+```
+
+Let's do a comparison between the variables picked now, and the ones picked before, without onehot encoding
+```{r}
+print(varImp(rangerFit_dum))
+print(varImp(rangerFit))
+```
+
+It appears that in the dummyfied version, the predictor polarizes towards sqft_living, whereas without dummyfying, it gives the grade, view and condition variables more importance. They seem to hold ordinal meaning that helps the classifier. Let's try to just one-hot encode zipcode and keep the most important variables only.
+
+Also, turning yr_built into decades and one-hot encoding them gives the year significantly less overall importance. Year will therefore be kept as a numeric variable (I also attempted further working with decade-dummies, which overall performed worse).
+
+```{r}
+varlist_1 <- list('zipcode', 'yr_built')
+
+train_dummyfied_1 <- to_cat(train_FE, varlist)
+test_dummyfied_1 <- to_cat(test_FE, varlist)
+val_dummyfied_1 <- to_cat(validate_FE, varlist)
+
+dmy_1 <- dummyVars(" ~ .", data = train_dummyfied_1, fullRank = F)
+# Most tree-based methods theoretically perform better without full rank of categorical variables
+train_dummyfied_1 <- data.frame(predict(dmy_1, newdata = train_dummyfied_1))
+test_dummyfied_1 <- data.frame(predict(dmy_1, newdata = test_dummyfied_1))
+val_dummyfied_1 <- data.frame(predict(dmy_1, newdata = val_dummyfied_1))
+
+
+set.seed(123)
+rangerFit_dum_1 <- train(
+  formula,
+  data = train_dummyfied_1,
+  method = "ranger", num.trees=100,
+  importance = 'permutation', # in order to calculate variable importance
+  preProc = NULL, 
+  tuneGrid = rangerFit$bestTune,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = rangerFit_dum_1, name = 'RF_zipcode_dummyfied', row = 4,
+                          test_actual = test_dummyfied_1, test_pred = predict(rangerFit_dum_1, test_dummyfied_1))
+
+print(rangerFit_dum_1)
+print(varImp(rangerFit_dum_1))
+varimp_ranger_df <- varImp(rangerFit_dum_1)$importance %>% 
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  arrange(Overall) %>%
+  mutate(rowname = forcats::fct_inorder(rowname))
+
+varimp_ranger_df <- varimp_ranger_df[order(varimp_ranger_df$Overall, decreasing = T),]
+print(varimp_ranger_df)
+```
+
+Now we could decide to just keep the most important zipcodes. A potential problem with them is that they are highly underrepresented. Interestingly, when comparing the most important zipcodes with this list of the wealthiest locations in king county, they are amongst the very top:
+https://www.propertyshark.com/Real-Estate-Reports/2017/10/04/expensive-zip-codes-washington-state-medina-homes-8x-pricier-u-s-median/
+
+I will therefore manually bin the most luxurious zipcodes together.
+```{r}
+df_list_binned <- df_list
+
+df_list_binned <- lapply(df_list_binned, function(df){
+  df[, luxury_zips := ifelse(zipcode %in% c(98039, 98004, 98040, 98112, 98075, 98006), 1, 0)]
+  df$zipcode <- NULL
+  # Drop other variables that ranked very low:
+  df$dummy_33 <- NULL
+  df
+})
+
+train_binned <- df_list_binned[1]$train_FE
+test_binned <- df_list_binned[2]$test_FE
+val_binned <- df_list_binned[3]$val_FE
+
+mean(train_binned$luxury_zips)
+```
+(Not so underrepresented anymore)
+
+
+Re-fit the random forest with these variables only
+```{r}
+set.seed(123)
+rangerFit_binned <- train(
+  formula,
+  data = train_binned,
+  method = "ranger", num.trees=100,
+  importance = 'permutation', # in order to calculate variable importance
+  preProc = NULL, 
+  tuneGrid = rangerFit$bestTune,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = rangerFit_binned, name = 'RF_binned', row = 5,
+                          test_actual = test_binned, test_pred = predict(rangerFit_binned, test_binned))
+
+results[1:5,]
+```
+
+I will continue with this dataset since it performs the best and has a reasonable number of variables.
+
+### Remove outliers
+
+```{r}
+#Manually explore the variables' distributions and exclude outliers based on boundaries
+numeric_vars <- df_train[ , names(df_train)[sapply(df_train, is.numeric)]] 
+outlier_plots = list()
+for (i in numeric_vars){
+  outlier_plots[[i]] <-
+    ggplot(
+      df_train,
+      aes_string(x=i, y = 'price')) +
+      geom_point() +
+      theme_bw()
+}
+
+outlier_plots[1:19]
+```
+
+The most extreme outliers will be removed
+```{r}
+train_cleaned <- train_binned[price < 3.5e6 & sqft_basement < 2000 & sqft_above < 5000 & sqft_lot < 4e5 &
+                              sqft_living < 7000 & bathrooms < 6 & bedrooms < 15]
+
+set.seed(123)
+rangerFit_cleaned <- train(
+  formula,
+  data = train_cleaned,
+  method = "ranger", num.trees=100,
+  importance = 'permutation', # in order to calculate variable importance
+  preProc = NULL, 
+  tuneGrid = rangerFit$bestTune,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = rangerFit_cleaned, name = 'RF_cleaned', row = 6,
+                          test_actual = test_binned, test_pred = predict(rangerFit_cleaned, test_binned))
+
+results[1:6,]
+```
+
+As expected, this significantly reduces overfitting, the large gap between CV-R^2 and test-R^2 disappears, the model generalizes better. Note that the actual number of observations dropped is very low.
+At the same time is is also worth noting, that the decrease in MAPE is minimal. Unsurprisingly, excluding the very expensive houses, model performance in the highest price segment dropped or at least did not improve, such that those predictions probably are very off.
+
+We can actually visualise the predictions to see where things are going wrong:
+```{r}
+plot_df <- cbind(test_binned, price_pred = predict(rangerFit_cleaned, test_binned))
+
+ggplot(data = plot_df, aes(price)) +
+  geom_point(aes(y = price_pred, colour = 'red')) +
+  geom_line(aes(y = price, colour = 'black'))
+```
+Indeed, we can see that the model consistently predicts too low prices for the very expensive houses. How can I fix this? I am also not entirely happy with the manual outlier-removal due to scalability limits.
+
+An alternative way to get rid of outliers, or more specifically to remove the skewness in variablaes' distributions, could be to take logs. Thus, I will now explore how the model performs when taking logs of the skewed variables.
+
+### Logarithmising to fix Skewness
+```{r}
+to_log <- function(df, l_varlist){
+  for(l_var in l_varlist){
+    df[,l_var] <- log(df[,l_var, with = F])
+  }
+  return(df)
+}
+
+log_varlist <- list('price', 'sqft_basement', 'sqft_above', 'sqft_lot', 'sqft_living',
+                    'bathrooms', 'bedrooms')
+
+train_log <- train_binned
+test_log <- test_binned
+# Add 1 in order to avoid negative values in log (monotonic transformation)
+train_log$sqft_basement <- train_log$sqft_basement + 1
+test_log$sqft_basement <- test_log$sqft_basement + 1
+
+train_log <- to_log(train_log, log_varlist)
+test_log <- to_log(test_log, log_varlist)
+```
+
+                              
+```{r}
+set.seed(123)
+rangerFit_log <- train(
+  formula,
+  data = train_log,
+  method = "ranger", num.trees=100,
+  importance = 'permutation', # in order to calculate variable importance
+  preProc = NULL, 
+  tuneGrid = rangerFit$bestTune,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = rangerFit_log, name = 'RF_log', row = 7,
+                          test_actual = test_FE, test_pred = exp(predict(rangerFit_log, test_log)))
+results[1:7,]
+```
+Comparability of the CV-MAPE is lost, but the test-MAPE improves as expected.
+
+I will now proceed to explore some different models
+
+### XGBoost
+```{r}
+tuneGrid_xgb <- expand.grid(nrounds = c(100, 200),
+                       max_depth = c(3, 5, 10),
                        colsample_bytree = seq(0.5, 0.9),
-                       ## The values below are default values in the sklearn-api. 
-                       eta = 0.1,
+                       eta = c(0.1, 0.3),
                        gamma=0,
-                       min_child_weight = 1,
-                       subsample = 1
+                       min_child_weight = c(1, 3),
+                       subsample = c(0.6, 1)
                       )
 
 ctrl_xgb <- trainControl(
@@ -507,46 +720,189 @@ ctrl_xgb <- trainControl(
 )
 
 set.seed(123)
-gbmFit <- train(
+xgbFit <- train(
   formula,
-  data = train_FE,
+  data = train_log,
   method = "xgbTree",
+  importance = 'permutation',
   preProc = NULL, 
   tuneGrid = tuneGrid_xgb,
   trControl = ctrl_xgb,
   metric = "RMSE"
 )
 
-results <- add_to_results(fit = gbmFit, name = 'GBM', row = 3,
-                          test_actual = test_FE, test_pred = predict(gbmFit, test_FE))
-```
+results <- add_to_results(fit = xgbFit, name = 'xgb', row = 8,
+                          test_actual = test_FE, test_pred = exp(predict(xgbFit, test_log)))
 
+results[1:8,]
+```
+XGBoost outperforms random forests
 
 ### Preprocessing
 Let's see if some preprocessing can improve the model
 
 Beginning with some standard preprocessing
+Most variables are already well-distributed as a result of taking the logarithm.
 ```{r}
 set.seed(123)
-gbmFit_preproc <- train(
+xgbFit_preproc <- train(
   formula,
-  data = train_FE,
+  data = train_log,
   method = "xgbTree",
   preProc = c('center','scale'), 
-  tuneGrid = tuneGrid_xgb,
+  tuneGrid = xgbFit$bestTune, # use the last best set of params
   trControl = ctrl_xgb,
   metric = "RMSE"
 )
 
-results <- add_to_results(fit = gbmFit_preproc, name = 'GBM_preproc', row = 4,
-                          test_actual = test_FE, test_pred = predict(gbmFit_preproc, test_FE))
+results <- add_to_results(fit = xgbFit_preproc, name = 'xgb_preproc', row = 9,
+                          test_actual = test_FE, test_pred = exp(predict(xgbFit_preproc, test_log)))
+results[1:9,]
+```
+This specification performs minimally worse in terms of CV-MAPE.
+
+PCA
+```{r}
+set.seed(123)
+xgbFit_pca <- train(
+  formula,
+  data = train_log,
+  method = "xgbTree",
+  preProc = c('pca'), 
+  tuneGrid = xgbFit$bestTune,
+  trControl = ctrl_xgb,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = xgbFit_pca, name = 'xgb_pca', row = 10,
+                          test_actual = test_FE, test_pred = exp(predict(xgbFit_pca, test_log)))
+
+results[1:10,]
+```
+Way worse! (We did not have that many variables anymore.)
+
+As a next step, let's run some more extensive grid searches, choosing the hyperparameter spaces based on what has worked well so far
+### Exhaustive Grid Search
+
+                              max.depth = c(3, 10, 25, 0),
+Random Forests:
+```{r}
+tuneGrid_ranger_opt <- expand.grid(mtry = c(round(1/2 * (length(train_cleaned))), round(2/3 * (length(train_cleaned)))),
+                              min.node.size=c(2,5,10,20),
+                              splitrule='variance')
+
+set.seed(123)
+rangerFit_opt_aux <- train(
+  formula,
+  data = train_log,
+  method = "ranger", num.trees=100,
+  importance = 'permutation',
+  preProc = NULL,
+  tuneGrid = tuneGrid_ranger_opt,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+#Re-fit Forest with set of best parameters and more trees
+rangerFit_opt <- train(
+  formula,
+  data = train_log,
+  method = "ranger", num.trees=1000,
+  importance = 'permutation',
+  preProc = c('center','scale'),
+  tuneGrid = rangerFit_opt_aux$bestTune,
+  trControl = ctrl_ranger,
+  metric = "RMSE"
+)
+
+rangerFit_opt
+
+results <- add_to_results(fit = rangerFit_opt, name = 'ranger_tuned', row = 11,
+                          test_actual = test_FE, test_pred = exp(predict(rangerFit_opt, test_log)))
+
+results[1:11,]
+```
+
+XGBoost
+```{r}
+tuneGrid_xgb_opt <- data.table(expand.grid(nrounds = c(100,200,300,500,1000),
+                       max_depth = c(1, 3, 5, 10),
+                       colsample_bytree = c(0.5, 0.7, 1),
+                       eta = c(0.05, 0.1, 0.3),
+                       gamma=0,
+                       min_child_weight = c(1, 3),
+                       subsample = 1
+                      ))
+
+set.seed(123)
+xgbFit_opt <- train(
+  formula,
+  data = train_log,
+  method = "xgbTree",
+  importance = 'permutation',
+  preProc = NULL, 
+  tuneGrid = tuneGrid_xgb_opt,
+  trControl = ctrl_xgb,
+  metric = "RMSE"
+)
+
+results <- add_to_results(fit = xgbFit_opt, name = 'xgb_tuned', row = 12,
+                          test_actual = test_FE, test_pred = exp(predict(xgbFit_opt, test_log)))
+
+results[1:12,]
 ```
 
 
+When models have (to some extend) uncorrelated errors, their combined error will be lower.
+### Stacked Model
+Therefore, creating an ensemble of the models estimated so far was attempted. Unfortunately, the R libraray for stacked models seems not to work well with the parallelization that has been used througout this project, also not if stopping the cluster, worker failures result. Outside of the parallelization envronment the stacked model seems fairly unfeasible, especially since the improvements that can be expected are minimal. Realistically, both models have highly correlated errors since they are quite similar.
+Thus, I will not further attempt stacking models.
+```{r}
+# Take the previous two best-performing models, make them predict the price for the test set:
+# Take those two predictions as input for yet another model:
+
+# stack_control <- trainControl(
+#   method="boot",
+#   number=25,
+#   savePredictions="final",
+#   classProbs=TRUE,
+#   index=createResample(train_cleaned$price, 25)
+#   )
+# 
+# library(caretEnsemble)
+# model_list <- caretList(
+#   formula, 
+#   data=train_cleaned,
+#   trControl=stack_control,
+#   methodList=c("ranger", "xgbTree")#,
+#   #tunelist=list(rf1=caretModelSpec(method="ranger", tuneGrid=rangerFit_opt$bestTune),
+#                 #gbt1=caretModelSpec(method="xgbTree", tuneGrid=xgbFit_opt$bestTune))
+#   )
+
+#xyplot(resamples(model_list))
+#modelCor(resamples(model_list))
+
+# greedy_ensemble <- caretEnsemble(
+#   model_list, 
+#   metric="RMSE",
+#   trControl=trainControl(
+#     method = 'cv',
+#     number=5,
+#     summaryFunction=mapeSummary
+#     ))
+# summary(greedy_ensemble)
+```
+
+## Final Prediction
+At last, I will fit the so far best model on the entire labelled data and use that to predict on the holdout set.
+```{r}
+df_final <- data[!is.na(price)]
+df_validate <- data[is.na(price)]
+
+```
 
 
-
-Quitting the cluster
+Stopping the cluster
 ```{r}
 stopCluster(cl)
 ```
